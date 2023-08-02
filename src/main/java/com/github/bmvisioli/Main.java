@@ -1,13 +1,11 @@
 package com.github.bmvisioli;
 
-import java.io.File;
-import java.nio.file.Files;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
@@ -22,41 +20,45 @@ import jdk.incubator.concurrent.StructuredTaskScope;
 
 public class Main {
 
-  /*
-    Disclaimers:
-	  - Superficial demo;
-	  - We'll completely ignore Green Threads;
-	  - Most here are low-level APIs and very prone to change;
-	  - Checked exceptions are suppressed;
+  /**
+   *
+   * <p>Use Case: Find users with an id between 0 and 10k</p>
    */
-
-  // Find users with an id between 0 and 10k
   public static void main(String[] args) {
+    printYellow("Pid : " + ProcessHandle.current().pid());
+
     StopWatch.start();
 
-    threads();
+    // Replace with one of the implementations
+    sequential();
 
     StopWatch.stopAndPrint();
   }
 
-  // Blocks the main thread;
-  // Executes commands sequentially (1 by 1);
-  // Execution time is the sum of each process execution time (in this case ~ 3h);
+  // Implementation
+
+  /**
+   *
+   * <li>Blocks the main thread;</li>
+   * <li>Executes commands sequentially (1 by 1);</li>
+   * <li>Execution time is the sum of each process execution time (in this case ~ 3h);</li>
+   */
   public static void sequential() {
-    var results = run(_10k, index -> UserRepository.findUser(index))
-        .collect(Collectors.toList());
+    var results = run(_10k, index -> UserRepository.findUser(index));
 
     // Do some other work...
     mainThreadWork();
 
-    System.out.println(results);
+    printGreen(results);
   }
 
-  // Platform Threads are 1-to-1 to OS Threads;
-  // OS Threads are expensive (2MB stacktrace);
-  // Also context-switching is expensive;
-  // Low-level API;
-  // Thread-leakage;
+  /**
+   *
+   * <li>Platform Threads are 1-to-1 to OS Threads;</li>
+   * <li>OS Threads are expensive (2MB stacktrace);</li>
+   * <li>Context-switching is expensive;</li>
+   * <li>Low-level API;</li>
+   */
   public static void threads() {
     var results = new ArrayList<User>();
 
@@ -71,13 +73,17 @@ public class Main {
 
     threads.forEach(Thread::join);
 
-    System.out.println(results);
+    printGreen(results);
   }
 
-  // Executors manage the creation, scheduling and pooling of threads;
-  // It uses a pool of threads (in most cases);
-  // Each thread is still 1-1 with OS Threads;
-  // Execution time is the sum of each process divided by number of threads in the pool;
+  /**
+   *
+   * <li>Executors manage the creation, scheduling and pooling of threads;</li>
+   * <li>Most frequently uses a thread pool;</li>
+   * <li>Each thread is still 1-1 with OS Threads;</li>
+   * <li>Returns a Future with a wrapped typed (higher-level API).</li>
+   * <img src="https://www.baeldung.com/wp-content/uploads/2016/08/2016-08-10_10-16-52-1024x572.png"/>
+   */
   public static void executors() {
     try (var executor = Executors.newFixedThreadPool(1000)) {
 
@@ -88,46 +94,57 @@ public class Main {
       // Do some other work...
       mainThreadWork();
 
-      var results = futures.map(Future::get)
+      var results = futures
+          .map(Future::get)
           .flatMap(Optional::stream)
           .collect(Collectors.toList());
 
-      System.out.println(results);
+      printGreen(results);
     }
   }
 
-  // Can be used to form a pipeline;
-  // Wraps around threads created by executors;
-  // By default uses ForkJoinPool.commonPool;
-  // The commonPool size defaults to available CPUs (1 running main thread);
-  // Unless another Executor is passed;
-  // Function coloring;
-  // They have another use;
+  /**
+   *
+   * <li>Used to form a pipeline;</li>
+   * <li>Wraps around old Futures created by executors;</li>
+   * <li>By default uses ForkJoinPool.commonPool...</li>
+   * <li>... unless another Executor is specified;</li>
+   * <li>Causes function colouring;</li>
+   */
   public static void completableFutures() {
-    var completableFutures = run(_10k, index ->
-        CompletableFuture.supplyAsync(() -> UserRepository.findUser(index))
-    );
+    try (var executor = Executors.newFixedThreadPool(1000)) {
 
-    // Do some other work
-    mainThreadWork();
+      var completableFutures = run(_10k, index ->
+          CompletableFuture.supplyAsync(() -> UserRepository.findUser(index), executor)
+      );
 
-    var results = completableFutures.stream()
-        .map(CompletableFuture::get)
-        .flatMap(Optional::stream)
-        .collect(Collectors.toList());
+      // Do some other work
+      mainThreadWork();
 
-    System.out.println(results);
+      CompletableFuture.allOf(completableFutures.toArray(CompletableFuture.emptyArray()))
+          .thenApply(__ ->
+              completableFutures.stream()
+                  .map(CompletableFuture::get)
+                  .flatMap(Optional::stream)
+                  .collect(Collectors.toList())
+          )
+          .thenAccept(Main::printGreen)
+          .join();
+    }
   }
 
-  // Virtual threads are cheap because...;
-  // ... their stack has a dynamic size ...;
-  // ... since it lives in the shared memory (heap);
-  // Seamlessly parallelism;
-  // Less context-switch;
-  // Integrate well wherever Threads and Executors are used;
-  // Great for IO-bound (wait) workloads, not for CPU-bound;
-  // Shouldn't be pooled;
-  public static void virtualThread() {
+  /**
+   *
+   * <li>Virtual threads are cheap because...;</li>
+   * <li>... their stack can have a dynamic size ...;</li>
+   * <li>... since it is stored in the heap space;</li>
+   * <li>Seamless parallelism;</li>
+   * <li>Example: Thread-per-request is practical again;</li>
+   * <li>Loom goal: Integrate well wherever Threads and Executors are used;</li>
+   * <li>Great for blocking workloads, makes no difference for CPU-bound;</li>
+   * <img src="https://i0.wp.com/theboreddev.com/wp-content/uploads/2022/11/scheduling.png?resize=780%2C358&ssl=1"/>
+   */
+  public static void virtualThreads() {
     try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
       var futures = run(_10k, index ->
           executor.submit(() -> UserRepository.findUser(index))
@@ -136,105 +153,125 @@ public class Main {
       // Do some other work
       mainThreadWork();
 
-      Thread.sleep(100000);
-
-      var results = futures.stream()
+      var results = futures
           .map(Future::get)
           .flatMap(Optional::stream)
           .collect(Collectors.toList());
 
-      System.out.println(results);
+      printGreen(results);
     }
   }
 
-  // Chaining together calls are at odds with the language syntax
-  // Using an event loop is at odds with the concurrency model
-  public static void virtualThread2() {
-    // Find two users and compare their departments
-
-    // Chaining CompletableFutures
-
-    UserRepository.findUserAsync(0)
+  /**
+   *
+   * Find two users and compare their departments
+   */
+  public static void completableFutures2() {
+    CompletableFuture.supplyAsync(() -> UserRepository.findUser(0))
         .thenCompose(user0Opt ->
-            UserRepository.findUserAsync(666)
-                .thenApply(user666Opt -> {
-                  throw new RuntimeException();
-                  // return user0Opt.map(User::department).equals(user666Opt.map(User::department));
-                })
+            CompletableFuture.supplyAsync(() -> UserRepository.findUser(666))
+                .thenApply(user666Opt -> user0Opt.map(User::department).equals(user666Opt.map(User::department)))
         )
-        .exceptionally(e -> {
-          if (e instanceof RuntimeException) {
-            return false;
-          } else if (e instanceof Exception) {
-            e.printStackTrace();
-            return false;
+        .whenComplete((result, exception) -> {
+          if (exception instanceof IllegalStateException) {
+            printRed("Got an IllegalStateException");
+          } else if (exception != null) {
+            exception.printStackTrace();
           } else {
-            return true;
+            printGreen("CompletableFuture result: " + result);
           }
         })
-        .thenAccept(result -> System.out.println("Future " + result))
         .join();
+  }
 
-    /*
-      var future = for {
-        user0Opt <- UserRepository.findUserAsync(0)
-        user666Opt <- UserRepository.findUserAsync(666)
-      } yield user0Opt.map(User::department).equals(user666Opt.map(User::department))
-
-      future.
-
-      println(future.get())
-     */
-
-    // With Virtual Threads
-
+  /**
+   *
+   * <li>Chaining together calls are at odds with the language syntax;</li>
+   * <li>Using an event loop is at odds with the concurrency model;</li>
+   */
+  public static void virtualThreads2() {
     try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-      try {
-        var user1Future = executor.submit(() -> UserRepository.findUser(0));
-        var user2Future = executor.submit(() -> UserRepository.findUser(666));
+      var user1Future = executor.submit(() -> UserRepository.findUser(0));
+      var user2Future = executor.submit(() -> UserRepository.findUser(666));
 
-        var user0 = user1Future.get();
-        var user666 = user2Future.get();
+      var user0 = user1Future.get();
+      var user666 = user2Future.get();
 
-        var result = user0.map(User::department).equals(user666.map(User::department));
+      var result = user0.map(User::department).equals(user666.map(User::department));
 
-        System.out.println("Virtual Thread " + result);
-      } catch (RuntimeException rE) {
-        System.out.println("RuntimeException: " + rE.getMessage());
-      } catch (Exception e) {
-        System.out.println("Exception: " + e.getMessage());
-      }
+      printGreen("Virtual Thread result: " + result);
+    } catch (IllegalStateException iSEx) {
+      printRed("Got an IllegalStateException");
+    } catch (Throwable t) {
+      t.printStackTrace();
     }
   }
 
-  // Starts the threads in the scope of the StructuredTaskScope;
-  // Shutdowns them as the scope's end;
-  // ShutdownOnSuccess waits until the first of the tasks finishes;
-  // Result is available scope.result;
-  public static void structuredAny() {
-    try (var scope = new StructuredTaskScope.ShutdownOnSuccess<List<Optional<User>>>()) {
-      scope.fork(() -> run(0, 1, index -> UserRepository.findUser(index)));
-      scope.fork(() -> run(9999, _10k, index -> UserRepository.findUser(index)));
-      scope.fork(() -> run(_10k, index -> UserRepository.findUser(index)));
+   /**
+   *
+   * <li>Beware of thread leakage;</li>
+   * <li>Creating millions of virtual threads is fine ...
+   * <ul>... just make sure you keep a reference ...</ul>
+   * <ul>... so that you can terminate them, for example;</ul>
+   * <ul>... And let Garbage-Collector clear the objects they reference;</ul></li>
+   * <li>Use StructuredScope;</li>
+   */
+  public static void virtualThreads3() {
+    var outerThread = Thread.ofVirtual().start(() -> {
+      Thread.ofVirtual().start(() ->
+          forever(() -> {
+            blockingProcess();
+            printYellow("Inner thread alive? " + Thread.currentThread().isAlive());
+          })
+      );
 
-      // Do some other work
+      throw new RuntimeException();
+    });
+
+    printRed("Outer thread is alive? " + outerThread.isAlive());
+
+    blockingProcess(1000);
+
+    printRed("Outer thread is alive? " + outerThread.isAlive());
+
+    blockingProcess(100000);
+  }
+
+  /**
+   *
+   * <li>Starts the threads in the scope of the StructuredTaskScope;</li>
+   * <li>Shutdowns them as the scope ends;</li>
+   * <li>ShutdownOnSuccess waits until the first of the tasks finishes;</li>
+   */
+  public static void structuredShutdownOnSuccess() {
+    try (var scope = new StructuredTaskScope.ShutdownOnSuccess<List<Optional<User>>>()) {
+      scope.fork(() -> run(_1k, index -> UserRepository.findUser(index)));
+      scope.fork(() -> run(_1k, index -> UserRepository.findUserButReallyFast(index)));
+
       mainThreadWork();
 
       var result = scope.join().result(e -> {
-        System.err.println(e.getMessage());
+        printRed(e.getMessage());
         return e;
       });
 
-      System.out.println(result);
+      var resultFlattened = result
+          .stream()
+          .flatMap(Optional::stream)
+          .collect(Collectors.toList());
+
+      printGreen(resultFlattened);
     }
   }
 
-  // Waits for all to finish and then kills the (virtual) threads;
-  // Doesn't have a result method;
-  public static void structuredAll() {
+  /**
+   *
+   * Waits for all to finish and then kills the (virtual) threads;
+   */
+  public static void structuredShutdownOnFailure() {
     try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-      var first = scope.fork(() -> run(0, 1, index -> UserRepository.findUser(index)));
-      var second = scope.fork(() -> run(9999, _10k, index -> UserRepository.findUser(index)));
+      var first = scope.fork(() -> run(0, _5k, index -> UserRepository.findUser(index)));
+      var second = scope.fork(() -> run(_5k, _10k, index -> UserRepository.findUserButFlaky(index)));
 
       // Do some other work
       mainThreadWork();
@@ -248,83 +285,89 @@ public class Main {
           .flatMap(Optional::stream)
           .collect(Collectors.toList());
 
-      System.out.println(allResults);
+      printGreen(allResults);
     }
   }
 
-  // Thread Local values
-
+  /**
+   *
+   * <li>ThreadLocals are...</li>
+   * <ul>... prone to leaking,</ul>
+   * <ul>... and mutable.</ul>
+   * </li>
+   */
   public static void threadLocal() {
-    ThreadLocal<User> activeUser = new InheritableThreadLocal<>();
-    ThreadLocal<UUID> sessionId = new InheritableThreadLocal<>();
+    ThreadLocal<String> threadLocal = new ThreadLocal<>();
 
-    Thread.ofPlatform().start(() -> {
-      System.out.println("1. Starting outer thread with active user: " + activeUser.get());
-      activeUser.set(new User(1, "Bronu", "Java"));
-      sessionId.set(UUID.randomUUID());
-
-      Thread.ofPlatform().start(() -> {
-        // Child threads will inherit ALL ThreadLocal values
-
-        System.out.println("2. Starting inner thread with active user: " + activeUser.get());
-        activeUser.set(new User(2, "Breno", "Java"));
-
-        System.out.println("3. Finished inner thread with active user: " + activeUser.get());
-      }).join();
-
-      // ThreadLocal values live until the thread ends (unless .remove())
-      System.out.println("4. Finished outer thread with active user: " + activeUser.get());
-    }).join();
+    try (var executorService = Executors.newFixedThreadPool(2)) {
+      executorService.execute(() -> {
+        threadLocal.set("Value set in thread #1");
+        printGreen("Thread " + Thread.currentThread().getName() + ": " + threadLocal.get());
+        threadLocal.remove();
+      });
+      executorService.execute(() ->
+          printYellow("Thread " + Thread.currentThread().getName() + ": " + threadLocal.get()));
+      executorService.execute(() ->
+          printRed("Thread " + Thread.currentThread().getName() + ": " + threadLocal.get()));
+    }
   }
 
-//  public static void scopedValues() {
-//    ScopedValue<User> activeUser = ScopedValue.newInstance();
-//
-//    ScopedValue.where(activeUser, new User(0, "Bruno", "Java"), () -> {
-//      try (var scope = new StructuredTaskScope<>()) {
-//
-//        scope.fork(() -> {
-//          System.out.println("1. Starting outer thread with active user: " + activeUser.get());
-//
-//          scope.fork(() -> {
-//            System.out.println("2. Starting inner thread with active user: " + activeUser.get());
-//              ScopedValue.where(activeUser, new User(0, "Breno", "Java"), () -> {
-//
-//                System.out.println("3. Finished inner thread with active user: " + activeUser.get());
-//              }
-//          });
-//        });
-//
-//      }
-//    });
-//  }
+  /**
+   *
+   * <li>Scoped values are
+   * <ul>... available only within its scope,</ul>
+   * <ul>... immutable (but overridable),</ul>
+   * <ul>... cheap to inherit;</ul>
+   * </li>
+   */
+  public static void scopedValue() {
+    ScopedValue<String> scopedValue = ScopedValue.newInstance();
 
-  // Takeaways!
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+      scope.fork(voidCallable(() ->
+        ScopedValue.where(scopedValue, "Value set in thread #1", () ->
+            printGreen("Thread " + Thread.currentThread() + ": " + scopedValue.orElse("null"))
+      )));
+      scope.fork(voidCallable(() ->
+          printRed("Thread " + Thread.currentThread() + ": " + scopedValue.orElse("null"))
+      ));
+      scope.fork(voidCallable(() ->
+          printYellow("Thread " + Thread.currentThread() + ": " + scopedValue.orElse("null"))
+      ));
 
-  // Don't block threads from the commonPool;
-  // Those should be kept for CPU-bound;
+      scope.join();
+    }
+  }
+
+  /**
+   *
+   * <li>Don't block threads from the commonPool;</li>
+   * <li>Those should be kept for CPU-bound tasks;</li>
+   */
   public static void keyTakeaway1() {
-    run(ForkJoinPool.getCommonPoolParallelism(), __ ->
+    run(1, 7, __ ->
         CompletableFuture.runAsync(() -> {
-          System.out.println("Waiting forever on thread " + threadName());
-          Thread.sleep(Long.MAX_VALUE);
+          printYellow("Waiting forever on thread " + threadName());
+          blockingProcess(Long.MAX_VALUE);
         }));
 
     var results = IntStream.rangeClosed(0, _10k)
         .parallel()
         .boxed()
         .filter(i -> {
-          System.out.println("Filtering the stream on thread " + threadName());
-          Thread.sleep(1000);
+          printYellow("Filtering the stream on thread " + threadName());
+          blockingProcess();
           return i % 2 == 0;
         }).collect(Collectors.toList());
 
-    System.out.println(results);
+    printGreen(results);
   }
 
-  // Virtual threads are not magically faster;
-  // They are limited by the resources they use (in this case CPUs);
-  // Virtual threads are good at waiting!
+  /**
+   *
+   * <li>Virtual threads are not magically faster;</li>
+   * <li>Virtual threads are good at waiting!</li>
+   */
   public static void keyTakeaway2() {
     try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
       var futures = run(_10k, __ -> executor.submit(Main::cpuHeavyProcess));
@@ -333,39 +376,20 @@ public class Main {
     }
   }
 
-  // Be aware of Thread pinning;
-  // In some cases Virtual Threads will not unmount from the Platform Threads;
-  // - Active IO;
-  // - Synchronized blocks or methods;
-  // - Native calls;
+  /**
+   *
+   * <li>Be aware of Thread pinning;</li>
+   * <li>In some cases Virtual Threads will not unmount from the Platform Threads;
+   * <ul>- Synchronized blocks or methods;</ul>
+   * <ul>- Native calls;</ul>
+   * </li>
+   */
   public static void keyTakeaway3() {
     try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
       var futures = run(_10k, __ -> executor.submit(new Synchronized()::block));
 
       futures.forEach(Future::get);
     }
-  }
-
-  // Beware of thread leakage;
-  // Creating millions of virtual threads is fine ...
-  // ... just make sure you keep a reference ...
-  // ... so that you can terminate them, for example;
-  // Use StructuredScope;
-  public static void keyTakeaway4() {
-    var outerThread = Thread.ofVirtual().start(() -> {
-      Thread.ofVirtual().start(() -> {
-        while (true) {
-          Thread.sleep(1000);
-          System.out.println("Inner thread alive? " + Thread.currentThread().isAlive());
-        }
-      });
-
-      throw new RuntimeException();
-    });
-
-    System.out.println("Outer thread is alive? " + outerThread.isAlive());
-
-    Thread.sleep(100000);
   }
 
   // EXTRA - ForkJoinPool
@@ -408,11 +432,16 @@ public class Main {
 
       var results = task.get();
 
-      System.out.println(results);
+      printGreen(results);
     }
   }
 
-  public static final int _10k = 10_000;
+  // Auxiliary Methods and Fields
+
+  public static final int _1k = 1_000;
+  public static final int _5k = _1k * 5;
+  public static final int _10k = _5k * 2;
+
 
   public static <V> List<V> run(int to, IntFunction<V> callable) {
     return run(0, to, callable);
@@ -440,36 +469,58 @@ public class Main {
 
   public static void mainThreadWork() {
     // Do some other work
-    Thread.sleep(1000);
-    printRed("Main thread work done");
+    blockingProcess(1000);
+    printGreen("Main thread work done");
   }
 
   public static void blockingProcess() {
-    Thread.sleep(1000);
+    blockingProcess(1000);
+  }
+
+  public static void blockingProcess(long time) {
+    Thread.sleep(time);
   }
 
   public static void cpuHeavyProcess() {
-    System.out.println("Heavy cpu process running on thread " + threadName());
+    printYellow("Heavy cpu process running on thread " + threadName());
     Collections.shuffle(IntStream.rangeClosed(0, 1_000_000).boxed().collect(Collectors.toList()));
   }
 
   public static String threadName() {
-    return Thread.currentThread().isVirtual() ? "Virtual - " + Thread.currentThread().threadId() : Thread.currentThread().getName();
+    return Thread.currentThread().isVirtual() ? Thread.currentThread().toString() : Thread.currentThread().getName();
   }
 
-  public static void printGreen(String string) {
-    System.out.println("\u001B[32m" + string);
+  public static void printYellow(Object string) {
+    System.out.println("\u001B[33m" + string + "\u001B[0m");
   }
 
-  public static void printRed(String string) {
-    System.out.println("\u001B[33m" + string);
+  public static void printRed(Object string) {
+    System.out.println("\u001B[31m" + string + "\u001B[0m");
+  }
+
+  public static void printGreen(Object string) {
+    System.out.println("\u001B[32m" + string + "\u001B[0m");
   }
 
   public static class Synchronized {
+
     public synchronized void block() {
-      System.out.println("Blocked, but in synchronized wait, on thread " + threadName());
+      printYellow("Blocked, but in synchronized wait, on thread " + threadName());
       blockingProcess();
     }
+  }
+
+  public static void forever(Runnable runnable) {
+    while (true) {
+      runnable.run();
+    }
+  }
+
+  public static Callable<Void> voidCallable(Runnable runnable) {
+    return () -> {
+      runnable.run();
+      return null;
+    };
   }
 }
 
